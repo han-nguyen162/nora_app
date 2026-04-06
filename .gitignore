@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment variables - NEVER commit this
+.env
+
+# Node
+node_modules/
+dist/
+.DS_Store
+
+# Editors
+.vscode/
+.cursor/
+*.suo
+*.user
+
+# Logs
+*.log
+npm-debug.log*
