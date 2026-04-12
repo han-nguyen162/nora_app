@@ -12,6 +12,7 @@ import {
   logout,
   refreshConnectionCode,
   register,
+  sendChatMessage,
   setToken,
   updateReminder,
 } from "./api.js";
@@ -58,8 +59,14 @@ export default function App() {
   const [authError, setAuthError] = useState("");
   const [busy, setBusy] = useState(false);
 
+  const recognitionRef = useRef(null);
+  const [voiceError, setVoiceError] = useState("");
+  const [noraSpeaking, setNoraSpeaking] = useState(false);
+
   const [voiceText, setVoiceText] = useState("");
   const [isListening, setIsListening] = useState(false);
+  const [chatResponse, setChatResponse] = useState("");
+  const [chatBusy, setChatBusy] = useState(false);
 
   const [reminders, setReminders] = useState([]);
   const [remindersLoading, setRemindersLoading] = useState(false);
@@ -120,6 +127,36 @@ export default function App() {
     } finally {
       setRemindersLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = "en-US";
+
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0].transcript)
+        .join(" ");
+      setVoiceText((prev) => `${prev} ${transcript}`.trim());
+    };
+
+    recognition.onerror = (event) => {
+      setVoiceError(`Speech recognition error: ${event.error}`);
+      setIsListening(false);
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+    };
+
+    recognitionRef.current = recognition;
   }, []);
 
   useEffect(() => {
@@ -203,12 +240,65 @@ export default function App() {
   };
 
   const handleVoiceButton = () => {
-    setIsListening((prev) => !prev);
+    setVoiceError("");
+    if (!recognitionRef.current) {
+      setVoiceError("Voice recognition is not supported in this browser.");
+      return;
+    }
+
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+      return;
+    }
+
+    try {
+      recognitionRef.current.start();
+      setIsListening(true);
+    } catch (error) {
+      setVoiceError("Cannot start voice recognition.");
+      setIsListening(false);
+    }
   };
 
-  const handleSendPrompt = () => {
-    console.log("Send to backend:", voiceText);
-    setVoiceText("");
+  const speakText = (text) => {
+    if (!window.speechSynthesis) return;
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US";
+    utterance.onstart = () => setNoraSpeaking(true);
+    utterance.onend = () => setNoraSpeaking(false);
+    utterance.onerror = () => setNoraSpeaking(false);
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const handleSendPrompt = async () => {
+    if (!voiceText.trim()) return;
+    if (!user) return;
+
+    setChatBusy(true);
+    setChatResponse("");
+    setVoiceError("");
+
+    try {
+      const targetOwnerId = user.role === "elder" ? user.id : elders[0]?.id;
+      if (user.role === "caregiver" && !targetOwnerId) {
+        throw new Error("Link with an elder first so Nora can answer about their reminders.");
+      }
+
+      const result = await sendChatMessage({
+        message: voiceText.trim(),
+        ownerUserId: targetOwnerId,
+      });
+      const reply = result.reply ?? "No response received.";
+      setChatResponse(reply);
+      setVoiceText("");
+      speakText(reply);
+    } catch (error) {
+      setChatResponse(error.message ?? "Could not send message to Nora.");
+    } finally {
+      setChatBusy(false);
+    }
   };
 
   const handleCreateReminder = async ({ title, category, description, dueLocal }) => {
@@ -307,6 +397,8 @@ export default function App() {
                 isListening={isListening}
                 onVoiceButton={handleVoiceButton}
                 onSendPrompt={handleSendPrompt}
+                chatResponse={chatResponse}
+                chatBusy={chatBusy}
                 onLogout={handleLogout}
                 onCreateReminder={handleCreateReminder}
                 onUpdateReminder={handleUpdateReminder}
@@ -607,6 +699,10 @@ function DashboardScreen({
           isListening={isListening}
           onVoiceButton={onVoiceButton}
           onSendPrompt={onSendPrompt}
+          chatResponse={chatResponse}
+          chatBusy={chatBusy}
+          voiceError={voiceError}
+          noraSpeaking={noraSpeaking}
         />
       </main>
     </>
@@ -695,7 +791,7 @@ function ReminderSection({
         </p>
       )}
 
-      <div className="max-h-[220px] space-y-2 overflow-y-auto pr-1">
+      <div className="max-h-[220px] space-y-0.5 overflow-y-auto pr-1">
         {!loading && reminders.length === 0 && (
           <div className="rounded-2xl bg-neutral-50 px-4 py-6 text-center text-sm text-neutral-500">
             {canCreateEvents ? "No events yet. Tap the 3 dots to create one." : "No events yet."}
@@ -774,14 +870,10 @@ function ReminderCard({ item, onEdit, onDelete }) {
   };
 
   return (
-    <div
-      className="overflow-hidden rounded-2xl"
-      onTouchStart={handleTouchStart}
-      onTouchEnd={handleTouchEnd}
-    >
+    <div className="overflow-hidden rounded-2xl">
       <div className="relative">
         <div
-          className={`flex items-center justify-end gap-2 rounded-2xl bg-neutral-100 px-3 py-2 transition-all ${
+          className={`absolute inset-y-0 right-0 flex items-center gap-2 pr-3 transition-all ${
             revealed ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >
@@ -802,9 +894,11 @@ function ReminderCard({ item, onEdit, onDelete }) {
         </div>
 
         <div
-          className={`flex items-center justify-between rounded-2xl bg-neutral-50 px-4 py-3 shadow-sm transition-transform duration-200 ${
-            revealed ? "translate-x-[-84px]" : "translate-x-0"
+          className={`flex items-center justify-between rounded-2xl bg-neutral-50 px-3 py-2 shadow-sm transition-transform duration-200 ${
+            revealed ? "-translate-x-[120px]" : "translate-x-0"
           }`}
+          onTouchStart={handleTouchStart}
+          onTouchEnd={handleTouchEnd}
         >
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold text-neutral-900">{item.title}</div>
@@ -813,9 +907,11 @@ function ReminderCard({ item, onEdit, onDelete }) {
             </div>
           </div>
 
-          <span className="ml-3 whitespace-nowrap rounded-full bg-violet-100 px-3 py-1 text-[11px] font-medium capitalize text-violet-700">
-            {item.type}
-          </span>
+          <div className="ml-3 flex items-center gap-2">
+            <span className="whitespace-nowrap rounded-full bg-violet-100 px-2.5 py-1 text-[11px] font-medium capitalize text-violet-700">
+              {item.type}
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -934,7 +1030,7 @@ function ReminderModal({ title, submitLabel, initialValues, onClose, onSubmit })
   );
 }
 
-function AssistantSection({ voiceText, setVoiceText, isListening, onVoiceButton, onSendPrompt }) {
+function AssistantSection({ voiceText, setVoiceText, isListening, onVoiceButton, onSendPrompt, chatResponse, chatBusy, voiceError, noraSpeaking }) {
   return (
     <section className="rounded-[1.7rem] bg-[#16151b] p-4 text-white shadow-lg">
       <div className="text-[11px] uppercase tracking-[0.3em] text-violet-300">Nora</div>
@@ -950,10 +1046,23 @@ function AssistantSection({ voiceText, setVoiceText, isListening, onVoiceButton,
         <button
           type="button"
           onClick={onSendPrompt}
-          className="mt-2 w-full rounded-2xl bg-white py-2 text-sm font-medium text-neutral-900"
+          disabled={chatBusy}
+          className="mt-2 w-full rounded-2xl bg-white py-2 text-sm font-medium text-neutral-900 disabled:opacity-60"
         >
-          Send to Nora
+          {chatBusy ? "Sending…" : "Send to Nora"}
         </button>
+
+        {voiceError && (
+          <div className="mt-3 rounded-2xl border border-red-300 bg-red-100 px-3 py-2 text-sm text-red-900">
+            {voiceError}
+          </div>
+        )}
+
+        {chatResponse && (
+          <div className="mt-3 rounded-2xl border border-white/10 bg-white/10 p-3 text-sm text-white/90">
+            {chatResponse}
+          </div>
+        )}
       </div>
 
       <div className="mt-3 flex flex-col items-center justify-center rounded-[1.5rem] bg-white/10 px-4 py-4">
@@ -968,7 +1077,7 @@ function AssistantSection({ voiceText, setVoiceText, isListening, onVoiceButton,
         </button>
 
         <div className="mt-3 text-xs text-white/80">
-          {isListening ? "Listening..." : "Tap to speak"}
+          {isListening ? "Listening..." : noraSpeaking ? "Speaking..." : "Tap to speak"}
         </div>
       </div>
     </section>

@@ -2,7 +2,7 @@ import hashlib
 import os
 import secrets
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -14,24 +14,19 @@ load_dotenv(BASE_DIR.parent / ".env")
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from openai import OpenAI
+import google.generativeai as genai
 from pydantic import BaseModel, EmailStr, Field
 
 app = FastAPI(title="Nora Backend")
 
 # =========================
-# OpenAI client (single instance)
+# Gemini client configuration
 # =========================
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -414,7 +409,7 @@ def link_caregiver_to_elder(
             },
         }
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     connections.append(
         {
             "caregiver_id": user["id"],
@@ -447,7 +442,7 @@ def create_reminder(
 
     assert_can_access_owner(user, reminder.ownerUserId)
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
 
     if reminder.dueDateTime <= now:
         raise HTTPException(status_code=400, detail="Reminder dueDateTime must be in the future")
@@ -493,7 +488,7 @@ def get_reminders(user: Annotated[dict, Depends(get_current_user)]):
 
 @app.get("/reminders/upcoming", response_model=list[Reminder])
 def get_upcoming_reminders(user: Annotated[dict, Depends(get_current_user)]):
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     upcoming = [
         reminder
         for reminder in reminders
@@ -556,7 +551,7 @@ def update_reminder(
     reminder = reminders[index]
     assert_can_mutate_reminder(user, reminder)
 
-    if body.dueDateTime <= datetime.now():
+    if body.dueDateTime <= datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Reminder dueDateTime must be in the future")
 
     if same_owner_same_datetime_exists(
@@ -573,7 +568,7 @@ def update_reminder(
     reminder["description"] = body.description.strip() if body.description else None
     reminder["category"] = body.category.strip()
     reminder["dueDateTime"] = body.dueDateTime
-    reminder["updatedAt"] = datetime.now()
+    reminder["updatedAt"] = datetime.now(timezone.utc)
 
     return reminder
 
@@ -607,8 +602,8 @@ def complete_reminder(
     assert_can_mutate_reminder(user, reminder)
 
     reminder["status"] = "completed"
-    reminder["completedAt"] = datetime.now()
-    reminder["updatedAt"] = datetime.now()
+    reminder["completedAt"] = datetime.now(timezone.utc)
+    reminder["updatedAt"] = datetime.now(timezone.utc)
 
     return reminder
 
@@ -675,7 +670,7 @@ def get_user_completed_reminders(
 
 @app.post("/reminders/check-overdue")
 def check_overdue_reminders(user: Annotated[dict, Depends(get_current_user)]):
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     updated_reminders = []
 
     for reminder in reminders:
@@ -707,10 +702,10 @@ def chat_with_nora(
     target_user = find_user_by_id(target_owner_id)
     target_name = target_user["display_name"] if target_user else "the user"
 
-    if not os.environ.get("OPENAI_API_KEY"):
+    if not os.environ.get("GEMINI_API_KEY"):
         raise HTTPException(
             status_code=500,
-            detail="OPENAI_API_KEY is not set on the backend",
+            detail="GEMINI_API_KEY is not set on the backend",
         )
 
     upcoming = [
@@ -729,29 +724,18 @@ def chat_with_nora(
     ]
 
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Nora, a warm, simple, voice-friendly assistant for older adults and caregivers. "
-                        "Keep answers short, calm, practical, and easy to understand. "
-                        "If the user asks about reminders or schedule, use the reminder context provided. "
-                        "Do not invent appointments that are not in context."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Current signed-in role: {user['role']}\n"
-                        f"Target person name: {target_name}\n"
-                        f"Upcoming reminder context: {upcoming_preview}\n\n"
-                        f"User message: {body.message}"
-                    ),
-                },
-            ],
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = (
+            "You are Nora, a warm, simple, voice-friendly assistant for older adults and caregivers. "
+            "Keep answers short, calm, practical, and easy to understand. "
+            "If the user asks about reminders or schedule, use the reminder context provided. "
+            "Do not invent appointments that are not in context.\n\n"
+            f"Current signed-in role: {user['role']}\n"
+            f"Target person name: {target_name}\n"
+            f"Upcoming reminder context: {upcoming_preview}\n\n"
+            f"User message: {body.message}"
         )
-        return {"reply": response.choices[0].message.content}
+        response = model.generate_content(prompt)
+        return {"reply": response.text}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI chat failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Gemini chat failed: {str(e)}")

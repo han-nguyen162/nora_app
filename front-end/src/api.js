@@ -150,3 +150,10 @@ export async function deleteReminder(reminderId) {
     method: "DELETE",
   });
 }
+
+export async function sendChatMessage({ message, ownerUserId }) {
+  return api("/chat", {
+    method: "POST",
+    body: JSON.stringify({ message, ownerUserId }),
+  });
+}
