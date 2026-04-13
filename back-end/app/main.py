@@ -39,6 +39,7 @@ reminders: list[dict] = []
 users: list[dict] = []
 sessions: dict[str, str] = {}  # token -> user_id
 connections: list[dict] = []   # caregiver_id + elder_id pairs
+emergency_alerts: list[dict] = []  # elder-triggered; caregivers poll
 
 security = HTTPBearer(auto_error=False)
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -97,6 +98,14 @@ def is_caregiver_linked_to_elder(caregiver_id: str, elder_id: str) -> bool:
         if row["caregiver_id"] == caregiver_id and row["elder_id"] == elder_id:
             return True
     return False
+
+
+def linked_caregiver_ids_for_elder(elder_id: str) -> list[str]:
+    return [row["caregiver_id"] for row in connections if row["elder_id"] == elder_id]
+
+
+def linked_elder_ids_for_caregiver(caregiver_id: str) -> list[str]:
+    return [row["elder_id"] for row in connections if row["caregiver_id"] == caregiver_id]
 
 
 def user_public(u: dict) -> dict:
@@ -226,6 +235,11 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+
+
+class EmergencyTriggerBody(BaseModel):
+    source: Literal["button", "voice"]
+    phrase: str | None = Field(None, max_length=500)
 
 
 # =========================
@@ -686,6 +700,100 @@ def check_overdue_reminders(user: Annotated[dict, Depends(get_current_user)]):
         "count": len(updated_reminders),
         "updatedReminders": updated_reminders,
     }
+
+
+# =========================
+# Emergency alerts (elder → linked caregivers)
+# =========================
+def _serialize_emergency_alert(a: dict) -> dict:
+    return {
+        "id": a["id"],
+        "elderId": a["elderId"],
+        "elderDisplayName": a["elderDisplayName"],
+        "createdAt": a["createdAt"].isoformat(),
+        "source": a["source"],
+        "phrase": a["phrase"],
+        "acknowledged": a["acknowledged"],
+    }
+
+
+@app.post("/emergency/trigger")
+def emergency_trigger(
+    body: EmergencyTriggerBody,
+    user: Annotated[dict, Depends(get_current_user)],
+):
+    if user["role"] != "elder":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the elder account can send an emergency alert",
+        )
+
+    if not linked_caregiver_ids_for_elder(user["id"]):
+        raise HTTPException(
+            status_code=400,
+            detail="No family member is linked yet. Share your connection code first.",
+        )
+
+    now = datetime.now(timezone.utc)
+    aid = str(uuid4())
+    emergency_alerts.append(
+        {
+            "id": aid,
+            "elderId": user["id"],
+            "elderDisplayName": user["display_name"],
+            "createdAt": now,
+            "source": body.source,
+            "phrase": (body.phrase.strip() or None) if body.phrase else None,
+            "acknowledged": False,
+            "acknowledgedAt": None,
+        }
+    )
+
+    return {
+        "ok": True,
+        "alertId": aid,
+        "notifiedCaregivers": len(linked_caregiver_ids_for_elder(user["id"])),
+    }
+
+
+@app.get("/emergency/alerts")
+def emergency_alerts_list(user: Annotated[dict, Depends(get_current_user)]):
+    if user["role"] != "caregiver":
+        raise HTTPException(
+            status_code=403,
+            detail="Only family (caregiver) accounts can view emergency alerts",
+        )
+
+    elder_ids = set(linked_elder_ids_for_caregiver(user["id"]))
+    matching = [a for a in emergency_alerts if a["elderId"] in elder_ids]
+    matching.sort(
+        key=lambda x: (x["acknowledged"], -x["createdAt"].timestamp()),
+    )
+    return {"alerts": [_serialize_emergency_alert(a) for a in matching]}
+
+
+@app.patch("/emergency/alerts/{alert_id}/ack")
+def emergency_acknowledge(
+    alert_id: str,
+    user: Annotated[dict, Depends(get_current_user)],
+):
+    if user["role"] != "caregiver":
+        raise HTTPException(
+            status_code=403,
+            detail="Only family (caregiver) accounts can acknowledge alerts",
+        )
+
+    elder_ids = set(linked_elder_ids_for_caregiver(user["id"]))
+    for a in emergency_alerts:
+        if a["id"] != alert_id:
+            continue
+        if a["elderId"] not in elder_ids:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        a["acknowledged"] = True
+        a["acknowledgedAt"] = datetime.now(timezone.utc)
+        return {"ok": True}
+
+    raise HTTPException(status_code=404, detail="Alert not found")
 
 
 # =========================

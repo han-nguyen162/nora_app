@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  acknowledgeEmergencyAlert,
   createReminder,
   deleteReminder,
+  fetchEmergencyAlerts,
   fetchLinkedCaregivers,
   fetchLinkedElders,
   fetchMe,
@@ -12,8 +14,8 @@ import {
   logout,
   refreshConnectionCode,
   register,
-  sendChatMessage,
   setToken,
+  triggerEmergency,
   updateReminder,
 } from "./api.js";
 
@@ -46,6 +48,39 @@ function defaultDueDatetimeLocal() {
   )}:${pad(d.getMinutes())}`;
 }
 
+/** Voice phrases that trigger an emergency alert (elder account). */
+const EMERGENCY_PHRASE_RE =
+  /\b(emergency|help\s*me|i\s*'?ve\s*fallen|i\s*fell|i\s*'?m\s*hurt|heart\s*attack|can\s*'?t\s*breathe|cannot\s*breathe|choking|bleeding\s*badly|call\s*911|send\s*help|need\s*help\s*now)\b/i;
+
+function transcriptLooksLikeEmergency(text) {
+  return EMERGENCY_PHRASE_RE.test(text.trim());
+}
+
+function playEmergencyAlarm() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const beep = (freq, start, dur) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.value = freq;
+      g.gain.value = 0.12;
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.start(start);
+      o.stop(start + dur);
+    };
+    beep(880, 0, 0.15);
+    beep(660, 0.2, 0.15);
+    beep(880, 0.4, 0.2);
+    setTimeout(() => ctx.close(), 800);
+  } catch {
+    /* ignore */
+  }
+}
+
 export default function App() {
   const [booting, setBooting] = useState(true);
   const [user, setUser] = useState(null);
@@ -60,13 +95,22 @@ export default function App() {
   const [busy, setBusy] = useState(false);
 
   const recognitionRef = useRef(null);
-  const [voiceError, setVoiceError] = useState("");
-  const [noraSpeaking, setNoraSpeaking] = useState(false);
+  const onVoiceTranscriptRef = useRef(null);
+  const emergencySendingRef = useRef(false);
+  const initialEmergencyPollRef = useRef(true);
+  const seenEmergencyIdsRef = useRef(new Set());
+  const listeningActiveRef = useRef(false);
+  const tryStartListeningRef = useRef(() => {});
+  const voiceCooldownUntilRef = useRef(0);
 
-  const [voiceText, setVoiceText] = useState("");
+  const [voiceError, setVoiceError] = useState("");
+  const [speechAvailable, setSpeechAvailable] = useState(false);
+
   const [isListening, setIsListening] = useState(false);
-  const [chatResponse, setChatResponse] = useState("");
-  const [chatBusy, setChatBusy] = useState(false);
+  const [emergencyStatus, setEmergencyStatus] = useState("");
+  const [emergencySending, setEmergencySending] = useState(false);
+  const [emergencyAlerts, setEmergencyAlerts] = useState([]);
+  const [ackBusyId, setAckBusyId] = useState(null);
 
   const [reminders, setReminders] = useState([]);
   const [remindersLoading, setRemindersLoading] = useState(false);
@@ -129,31 +173,57 @@ export default function App() {
     }
   }, []);
 
+  tryStartListeningRef.current = () => {
+    const r = recognitionRef.current;
+    if (!r || !listeningActiveRef.current) return;
+    try {
+      r.start();
+      setIsListening(true);
+    } catch {
+      /* InvalidStateError: already running */
+    }
+  };
+
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
       return;
     }
 
+    setSpeechAvailable(true);
     const recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = false;
+    recognition.continuous = true;
+    recognition.interimResults = true;
     recognition.lang = "en-US";
 
     recognition.onresult = (event) => {
-      const transcript = Array.from(event.results)
-        .map((result) => result[0].transcript)
-        .join(" ");
-      setVoiceText((prev) => `${prev} ${transcript}`.trim());
+      let full = "";
+      for (let i = 0; i < event.results.length; i++) {
+        full += event.results[i][0].transcript;
+      }
+      full = full.trim();
+      if (full) onVoiceTranscriptRef.current?.(full);
     };
 
     recognition.onerror = (event) => {
-      setVoiceError(`Speech recognition error: ${event.error}`);
+      if (event.error === "no-speech" || event.error === "aborted") {
+        return;
+      }
+      if (event.error === "not-allowed") {
+        setVoiceError(
+          "Microphone access is off. Allow the mic in your browser settings, or tap the screen once and try again.",
+        );
+        setIsListening(false);
+        return;
+      }
+      setVoiceError(`Voice: ${event.error}`);
       setIsListening(false);
     };
 
     recognition.onend = () => {
       setIsListening(false);
+      if (!listeningActiveRef.current) return;
+      setTimeout(() => tryStartListeningRef.current(), 200);
     };
 
     recognitionRef.current = recognition;
@@ -164,6 +234,125 @@ export default function App() {
       loadLinksAndReminders(user);
     }
   }, [user, screen, loadLinksAndReminders]);
+
+  const handleEmergencyVoice = useCallback(async (phrase) => {
+    if (!user || user.role !== "elder") return;
+    if (emergencySendingRef.current) return;
+    emergencySendingRef.current = true;
+    setEmergencySending(true);
+    setEmergencyStatus("");
+    setVoiceError("");
+    try {
+      const r = await triggerEmergency({ source: "voice", phrase });
+      setEmergencyStatus(
+        `Emergency heard. Alert sent to ${r.notifiedCaregivers} linked contact(s).`,
+      );
+    } catch (e) {
+      setEmergencyStatus(e.message ?? "Could not send alert.");
+    } finally {
+      emergencySendingRef.current = false;
+      setEmergencySending(false);
+    }
+  }, [user]);
+
+  const handleEmergencyButton = useCallback(async () => {
+    if (!user || user.role !== "elder") return;
+    setEmergencyStatus("");
+    setVoiceError("");
+    setEmergencySending(true);
+    try {
+      const r = await triggerEmergency({ source: "button", phrase: null });
+      setEmergencyStatus(`Alert sent to ${r.notifiedCaregivers} linked contact(s).`);
+    } catch (e) {
+      setEmergencyStatus(e.message ?? "Could not send alert.");
+    } finally {
+      setEmergencySending(false);
+    }
+  }, [user]);
+
+  useEffect(() => {
+    onVoiceTranscriptRef.current = (transcript) => {
+      if (user?.role !== "elder") return;
+      if (!transcriptLooksLikeEmergency(transcript)) return;
+      if (Date.now() < voiceCooldownUntilRef.current) return;
+      voiceCooldownUntilRef.current = Date.now() + 10000;
+      void handleEmergencyVoice(transcript);
+    };
+  }, [user, handleEmergencyVoice]);
+
+  useEffect(() => {
+    const active = user?.role === "elder" && screen === "dashboard";
+    listeningActiveRef.current = active;
+    if (!active) {
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        /* noop */
+      }
+      setIsListening(false);
+      return;
+    }
+    const t = setTimeout(() => tryStartListeningRef.current(), 400);
+    return () => {
+      clearTimeout(t);
+      listeningActiveRef.current = false;
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        /* noop */
+      }
+    };
+  }, [user, screen]);
+
+  useEffect(() => {
+    if (user?.role !== "elder" || screen !== "dashboard") return;
+    const kick = () => tryStartListeningRef.current();
+    document.addEventListener("pointerdown", kick, { passive: true, once: true });
+    return () => document.removeEventListener("pointerdown", kick);
+  }, [user, screen]);
+
+  useEffect(() => {
+    if (!user || user.role !== "caregiver" || screen !== "dashboard") return;
+
+    const poll = async () => {
+      try {
+        const { alerts } = await fetchEmergencyAlerts();
+        setEmergencyAlerts(alerts);
+
+        if (initialEmergencyPollRef.current) {
+          alerts.forEach((a) => seenEmergencyIdsRef.current.add(a.id));
+          initialEmergencyPollRef.current = false;
+          return;
+        }
+
+        const newAlerts = alerts.filter((a) => !seenEmergencyIdsRef.current.has(a.id));
+        newAlerts.forEach((a) => seenEmergencyIdsRef.current.add(a.id));
+        if (newAlerts.some((a) => !a.acknowledged)) {
+          playEmergencyAlarm();
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+
+    poll();
+    const id = setInterval(poll, 4000);
+    return () => clearInterval(id);
+  }, [user, screen]);
+
+  const handleAckEmergency = useCallback(async (alertId) => {
+    setAckBusyId(alertId);
+    try {
+      await acknowledgeEmergencyAlert(alertId);
+      setEmergencyAlerts((prev) =>
+        prev.map((a) => (a.id === alertId ? { ...a, acknowledged: true } : a)),
+      );
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setAckBusyId(null);
+    }
+  }, []);
 
   const handleAuth = async () => {
     setAuthError("");
@@ -201,6 +390,10 @@ export default function App() {
     setReminders([]);
     setElders([]);
     setCaregivers([]);
+    setEmergencyAlerts([]);
+    setEmergencyStatus("");
+    initialEmergencyPollRef.current = true;
+    seenEmergencyIdsRef.current = new Set();
   };
 
   const handleCaregiverLink = async () => {
@@ -236,68 +429,6 @@ export default function App() {
       setLinkMsg("Code copied.");
     } catch {
       setLinkMsg("Copy manually if needed.");
-    }
-  };
-
-  const handleVoiceButton = () => {
-    setVoiceError("");
-    if (!recognitionRef.current) {
-      setVoiceError("Voice recognition is not supported in this browser.");
-      return;
-    }
-
-    if (isListening) {
-      recognitionRef.current.stop();
-      setIsListening(false);
-      return;
-    }
-
-    try {
-      recognitionRef.current.start();
-      setIsListening(true);
-    } catch (error) {
-      setVoiceError("Cannot start voice recognition.");
-      setIsListening(false);
-    }
-  };
-
-  const speakText = (text) => {
-    if (!window.speechSynthesis) return;
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-    utterance.onstart = () => setNoraSpeaking(true);
-    utterance.onend = () => setNoraSpeaking(false);
-    utterance.onerror = () => setNoraSpeaking(false);
-    window.speechSynthesis.speak(utterance);
-  };
-
-  const handleSendPrompt = async () => {
-    if (!voiceText.trim()) return;
-    if (!user) return;
-
-    setChatBusy(true);
-    setChatResponse("");
-    setVoiceError("");
-
-    try {
-      const targetOwnerId = user.role === "elder" ? user.id : elders[0]?.id;
-      if (user.role === "caregiver" && !targetOwnerId) {
-        throw new Error("Link with an elder first so Nora can answer about their reminders.");
-      }
-
-      const result = await sendChatMessage({
-        message: voiceText.trim(),
-        ownerUserId: targetOwnerId,
-      });
-      const reply = result.reply ?? "No response received.";
-      setChatResponse(reply);
-      setVoiceText("");
-      speakText(reply);
-    } catch (error) {
-      setChatResponse(error.message ?? "Could not send message to Nora.");
-    } finally {
-      setChatBusy(false);
     }
   };
 
@@ -392,13 +523,15 @@ export default function App() {
                 onLink={handleCaregiverLink}
                 onRefreshCode={handleRefreshCode}
                 onCopyCode={handleCopyCode}
-                voiceText={voiceText}
-                setVoiceText={setVoiceText}
                 isListening={isListening}
-                onVoiceButton={handleVoiceButton}
-                onSendPrompt={handleSendPrompt}
-                chatResponse={chatResponse}
-                chatBusy={chatBusy}
+                speechAvailable={speechAvailable}
+                voiceError={voiceError}
+                emergencyStatus={emergencyStatus}
+                emergencySending={emergencySending}
+                onEmergencyButton={handleEmergencyButton}
+                emergencyAlerts={emergencyAlerts}
+                onAckEmergency={handleAckEmergency}
+                ackBusyId={ackBusyId}
                 onLogout={handleLogout}
                 onCreateReminder={handleCreateReminder}
                 onUpdateReminder={handleUpdateReminder}
@@ -561,11 +694,15 @@ function DashboardScreen({
   onLink,
   onRefreshCode,
   onCopyCode,
-  voiceText,
-  setVoiceText,
   isListening,
-  onVoiceButton,
-  onSendPrompt,
+  speechAvailable,
+  voiceError,
+  emergencyStatus,
+  emergencySending,
+  onEmergencyButton,
+  emergencyAlerts,
+  onAckEmergency,
+  ackBusyId,
   onLogout,
   onCreateReminder,
   onUpdateReminder,
@@ -681,6 +818,14 @@ function DashboardScreen({
           </section>
         )}
 
+        {!isElder && (
+          <EmergencyCaregiverBanner
+            alerts={emergencyAlerts}
+            onAcknowledge={onAckEmergency}
+            busyId={ackBusyId}
+          />
+        )}
+
         <SummaryCard reminders={reminders} loading={remindersLoading} />
 
         <ReminderSection
@@ -693,17 +838,17 @@ function DashboardScreen({
           onDeleteReminder={onDeleteReminder}
         />
 
-        <AssistantSection
-          voiceText={voiceText}
-          setVoiceText={setVoiceText}
-          isListening={isListening}
-          onVoiceButton={onVoiceButton}
-          onSendPrompt={onSendPrompt}
-          chatResponse={chatResponse}
-          chatBusy={chatBusy}
-          voiceError={voiceError}
-          noraSpeaking={noraSpeaking}
-        />
+        {isElder && (
+          <EmergencyElderSection
+            hasLinkedCaregivers={caregivers.length > 0}
+            busy={emergencySending}
+            status={emergencyStatus}
+            voiceError={voiceError}
+            isListening={isListening}
+            speechAvailable={speechAvailable}
+            onEmergencyButton={onEmergencyButton}
+          />
+        )}
       </main>
     </>
   );
@@ -753,7 +898,7 @@ function ReminderSection({
         <div>
           <div className="text-base font-semibold text-neutral-900">Upcoming events</div>
           <div className="text-xs text-neutral-500">
-            {loading ? "Loading…" : "Swipe right on an event to edit or delete"}
+            {loading ? "Loading…" : "Tap or click an event to edit or delete"}
           </div>
         </div>
 
@@ -850,9 +995,19 @@ function ReminderSection({
 function ReminderCard({ item, onEdit, onDelete }) {
   const [revealed, setRevealed] = useState(false);
   const startXRef = useRef(null);
+  const movedRef = useRef(false);
+  const swipeConsumedClickRef = useRef(false);
 
   const handleTouchStart = (e) => {
+    movedRef.current = false;
     startXRef.current = e.changedTouches[0]?.clientX ?? null;
+  };
+
+  const handleTouchMove = (e) => {
+    const t = e.changedTouches[0];
+    if (t && startXRef.current != null && Math.abs(t.clientX - startXRef.current) > 10) {
+      movedRef.current = true;
+    }
   };
 
   const handleTouchEnd = (e) => {
@@ -862,43 +1017,67 @@ function ReminderCard({ item, onEdit, onDelete }) {
 
     if (diff > 55) {
       setRevealed(true);
+      swipeConsumedClickRef.current = true;
     } else if (diff < -35) {
       setRevealed(false);
+      swipeConsumedClickRef.current = true;
     }
 
     startXRef.current = null;
+  };
+
+  const handleRowClick = () => {
+    if (swipeConsumedClickRef.current) {
+      swipeConsumedClickRef.current = false;
+      return;
+    }
+    if (movedRef.current) return;
+    setRevealed((r) => !r);
+  };
+
+  const handleEdit = (e) => {
+    e.stopPropagation();
+    onEdit();
+  };
+
+  const handleDelete = (e) => {
+    e.stopPropagation();
+    onDelete();
   };
 
   return (
     <div className="overflow-hidden rounded-2xl">
       <div className="relative">
         <div
-          className={`absolute inset-y-0 right-0 flex items-center gap-2 pr-3 transition-all ${
+          className={`absolute inset-y-0 right-0 z-10 flex items-center gap-2 pr-3 transition-all ${
             revealed ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >
           <button
             type="button"
-            onClick={onEdit}
+            onClick={handleEdit}
             className="rounded-xl bg-sky-600 px-3 py-2 text-xs font-semibold text-white"
           >
             Edit
           </button>
           <button
             type="button"
-            onClick={onDelete}
+            onClick={handleDelete}
             className="rounded-xl bg-red-500 px-3 py-2 text-xs font-semibold text-white"
           >
             Delete
           </button>
         </div>
 
-        <div
-          className={`flex items-center justify-between rounded-2xl bg-neutral-50 px-3 py-2 shadow-sm transition-transform duration-200 ${
+        <button
+          type="button"
+          onClick={handleRowClick}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          className={`flex w-full cursor-pointer items-center justify-between rounded-2xl bg-neutral-50 px-3 py-2 text-left shadow-sm transition-transform duration-200 ${
             revealed ? "-translate-x-[120px]" : "translate-x-0"
           }`}
-          onTouchStart={handleTouchStart}
-          onTouchEnd={handleTouchEnd}
         >
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold text-neutral-900">{item.title}</div>
@@ -912,7 +1091,7 @@ function ReminderCard({ item, onEdit, onDelete }) {
               {item.type}
             </span>
           </div>
-        </div>
+        </button>
       </div>
     </div>
   );
@@ -1030,55 +1209,103 @@ function ReminderModal({ title, submitLabel, initialValues, onClose, onSubmit })
   );
 }
 
-function AssistantSection({ voiceText, setVoiceText, isListening, onVoiceButton, onSendPrompt, chatResponse, chatBusy, voiceError, noraSpeaking }) {
+function EmergencyCaregiverBanner({ alerts, onAcknowledge, busyId }) {
+  const unacked = alerts.filter((a) => !a.acknowledged);
+  if (unacked.length === 0) return null;
+
   return (
-    <section className="rounded-[1.7rem] bg-[#16151b] p-4 text-white shadow-lg">
-      <div className="text-[11px] uppercase tracking-[0.3em] text-violet-300">Nora</div>
-      <div className="mt-1 text-lg font-semibold">How can I help you?</div>
-
-      <div className="mt-3 rounded-[1.5rem] bg-white/10 p-3">
-        <textarea
-          value={voiceText}
-          onChange={(e) => setVoiceText(e.target.value)}
-          placeholder="Type a message (voice can plug in here)…"
-          className="h-20 w-full resize-none rounded-xl border border-white/10 bg-white/10 p-3 text-sm text-white placeholder:text-white/50 outline-none"
-        />
-        <button
-          type="button"
-          onClick={onSendPrompt}
-          disabled={chatBusy}
-          className="mt-2 w-full rounded-2xl bg-white py-2 text-sm font-medium text-neutral-900 disabled:opacity-60"
+    <section className="mb-3 space-y-2 rounded-[1.7rem] border-2 border-red-600 bg-red-50 p-3 shadow-lg">
+      <div className="text-center text-sm font-bold uppercase tracking-wide text-red-800">
+        Emergency alert
+      </div>
+      {unacked.map((a) => (
+        <div
+          key={a.id}
+          className="rounded-2xl border border-red-200 bg-white p-3 text-sm shadow-sm"
         >
-          {chatBusy ? "Sending…" : "Send to Nora"}
-        </button>
+          <div className="font-semibold text-neutral-900">{a.elderDisplayName}</div>
+          <div className="mt-1 text-xs text-neutral-600">
+            {new Date(a.createdAt).toLocaleString()} ·{" "}
+            {a.source === "voice" ? "Voice phrase" : "Emergency button"}
+            {a.phrase ? ` · “${a.phrase}”` : ""}
+          </div>
+          <button
+            type="button"
+            disabled={busyId === a.id}
+            onClick={() => onAcknowledge(a.id)}
+            className="mt-2 w-full rounded-xl bg-red-600 py-2.5 text-xs font-semibold text-white disabled:opacity-60"
+          >
+            {busyId === a.id ? "Saving…" : "I’m responding — dismiss alert"}
+          </button>
+        </div>
+      ))}
+    </section>
+  );
+}
 
+function EmergencyElderSection({
+  hasLinkedCaregivers,
+  busy,
+  status,
+  voiceError,
+  isListening,
+  speechAvailable,
+  onEmergencyButton,
+}) {
+  return (
+    <section className="rounded-[1.7rem] border border-red-200 bg-gradient-to-b from-red-50 to-white p-4 shadow-lg">
+      <div className="text-[11px] uppercase tracking-[0.3em] text-red-700">Safety</div>
+      <p className="mt-1 text-sm leading-snug text-neutral-700">
+        Tap <span className="font-semibold">Emergency</span> or say help words out loud — we listen
+        continuously so you don’t have to press anything first. Linked family gets an alert in
+        their app.
+      </p>
+      <button
+        type="button"
+        disabled={busy || !hasLinkedCaregivers}
+        onClick={onEmergencyButton}
+        className="mt-4 w-full rounded-[1.5rem] bg-red-600 py-4 text-lg font-bold text-white shadow-lg disabled:opacity-50"
+      >
+        {busy ? "Sending…" : "Emergency"}
+      </button>
+      {!hasLinkedCaregivers && (
+        <p className="mt-2 text-center text-xs text-amber-800">
+          Link a family member with your code above before alerts can be sent.
+        </p>
+      )}
+      {status && (
+        <p className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-center text-xs text-emerald-900">
+          {status}
+        </p>
+      )}
+      <div className="mt-4 rounded-[1.5rem] border border-neutral-200 bg-neutral-50 px-4 py-3">
+        {!speechAvailable ? (
+          <p className="text-center text-xs text-neutral-600">
+            Voice listening isn’t available in this browser — use the Emergency button.
+          </p>
+        ) : (
+          <>
+            <div className="flex items-center justify-center gap-2">
+              <span
+                className={`h-2.5 w-2.5 rounded-full ${
+                  isListening ? "animate-pulse bg-red-600" : "bg-neutral-400"
+                }`}
+                aria-hidden
+              />
+              <span className="text-xs font-medium text-neutral-800">
+                {isListening ? "Listening for help words…" : "Starting microphone…"}
+              </span>
+            </div>
+            <p className="mt-2 text-center text-[11px] text-neutral-500">
+              Try: “emergency”, “help me”, “I’ve fallen” — works as soon as you speak.
+            </p>
+          </>
+        )}
         {voiceError && (
-          <div className="mt-3 rounded-2xl border border-red-300 bg-red-100 px-3 py-2 text-sm text-red-900">
+          <div className="mt-2 rounded-xl border border-red-200 bg-red-50 px-2 py-2 text-center text-xs text-red-800">
             {voiceError}
           </div>
         )}
-
-        {chatResponse && (
-          <div className="mt-3 rounded-2xl border border-white/10 bg-white/10 p-3 text-sm text-white/90">
-            {chatResponse}
-          </div>
-        )}
-      </div>
-
-      <div className="mt-3 flex flex-col items-center justify-center rounded-[1.5rem] bg-white/10 px-4 py-4">
-        <button
-          type="button"
-          onClick={onVoiceButton}
-          className={`flex h-16 w-16 items-center justify-center rounded-full text-xl text-white shadow-lg transition ${
-            isListening ? "scale-105 bg-violet-700" : "bg-violet-500"
-          }`}
-        >
-          ●
-        </button>
-
-        <div className="mt-3 text-xs text-white/80">
-          {isListening ? "Listening..." : noraSpeaking ? "Speaking..." : "Tap to speak"}
-        </div>
       </div>
     </section>
   );

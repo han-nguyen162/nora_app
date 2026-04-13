@@ -151,9 +151,22 @@ export async function deleteReminder(reminderId) {
   });
 }
 
-export async function sendChatMessage({ message, ownerUserId }) {
-  return api("/chat", {
+export async function triggerEmergency({ source, phrase }) {
+  return api("/emergency/trigger", {
     method: "POST",
-    body: JSON.stringify({ message, ownerUserId }),
+    body: JSON.stringify({
+      source,
+      phrase: phrase ?? null,
+    }),
+  });
+}
+
+export async function fetchEmergencyAlerts() {
+  return api("/emergency/alerts");
+}
+
+export async function acknowledgeEmergencyAlert(alertId) {
+  return api(`/emergency/alerts/${encodeURIComponent(alertId)}/ack`, {
+    method: "PATCH",
   });
 }
