@@ -3,12 +3,12 @@ const API_BASE = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 const TOKEN_KEY = "nora_token";
 
 export function getToken() {
-  return localStorage.getItem(TOKEN_KEY);
+  return sessionStorage.getItem(TOKEN_KEY);
 }
 
 export function setToken(token) {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
+  if (token) sessionStorage.setItem(TOKEN_KEY, token);
+  else sessionStorage.removeItem(TOKEN_KEY);
 }
 
 function parseErrorDetail(detail) {
@@ -111,6 +111,10 @@ export async function fetchLinkedCaregivers() {
   return api("/connections/caregivers");
 }
 
+export async function fetchReminders() {
+  return api("/reminders");
+}
+
 export async function fetchUserReminders(userId) {
   return api(`/users/${encodeURIComponent(userId)}/reminders`);
 }
@@ -125,7 +129,7 @@ export async function createReminder(body) {
       description: body.description ?? null,
       category: body.category,
       dueDateTime: body.dueDateTime,
-      repeatType: null,
+      repeatType: body.repeatType ?? null,
       voiceCreated: false,
       isCritical: false,
       escalationEnabled: false,
@@ -141,6 +145,7 @@ export async function updateReminder(reminderId, body) {
       description: body.description ?? null,
       category: body.category,
       dueDateTime: body.dueDateTime,
+      repeatType: body.repeatType ?? null,
     }),
   });
 }
@@ -168,5 +173,26 @@ export async function fetchEmergencyAlerts() {
 export async function acknowledgeEmergencyAlert(alertId) {
   return api(`/emergency/alerts/${encodeURIComponent(alertId)}/ack`, {
     method: "PATCH",
+  });
+}
+
+export async function chatWithNora({ message, ownerUserId }) {
+  return api("/chat", {
+    method: "POST",
+    body: JSON.stringify({ message, ownerUserId: ownerUserId ?? null }),
+  });
+}
+
+export async function prepareTask(reminderId) {
+  return api("/prepare-task", {
+    method: "POST",
+    body: JSON.stringify({ reminder_id: reminderId }),
+  });
+}
+
+export async function detectEmergency(phrase) {
+  return api("/emergency/detect", {
+    method: "POST",
+    body: JSON.stringify({ phrase }),
   });
 }

@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   acknowledgeEmergencyAlert,
+  chatWithNora,
   createReminder,
   deleteReminder,
+  detectEmergency,
   fetchEmergencyAlerts,
   fetchLinkedCaregivers,
   fetchLinkedElders,
   fetchMe,
+  fetchReminders,
   fetchUserReminders,
   getToken,
   linkWithCode,
   login,
   logout,
+  prepareTask,
   refreshConnectionCode,
   register,
   setToken,
@@ -31,6 +35,7 @@ function mapReminderFromApi(r) {
     day: WEEK[d.getDay()] ?? "—",
     time: d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }),
     type: r.category || "personal",
+    repeatType: r.repeatType ?? null,
     description: r.description || "",
     dueDateTime: r.dueDateTime,
     dueLocal: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(
@@ -97,6 +102,7 @@ export default function App() {
   const recognitionRef = useRef(null);
   const onVoiceTranscriptRef = useRef(null);
   const emergencySendingRef = useRef(false);
+  const chatBusyRef = useRef(false);
   const initialEmergencyPollRef = useRef(true);
   const seenEmergencyIdsRef = useRef(new Set());
   const listeningActiveRef = useRef(false);
@@ -117,6 +123,11 @@ export default function App() {
   const [linkMsg, setLinkMsg] = useState("");
   const [elders, setElders] = useState([]);
   const [caregivers, setCaregivers] = useState([]);
+
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatPrefill, setChatPrefill] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -145,31 +156,23 @@ export default function App() {
     };
   }, []);
 
-  const loadLinksAndReminders = useCallback(async (u) => {
+  const loadLinksAndReminders = useCallback(async (u, { silent = false } = {}) => {
     if (!u) return;
 
-    setRemindersLoading(true);
+    if (!silent) setRemindersLoading(true);
     try {
       if (u.role === "caregiver") {
         const list = await fetchLinkedElders();
         setElders(list);
-
-        const targetId = list[0]?.id;
-        if (targetId) {
-          const raw = await fetchUserReminders(targetId);
-          setReminders(raw.map(mapReminderFromApi));
-        } else {
-          setReminders([]);
-        }
       } else {
         setCaregivers(await fetchLinkedCaregivers());
-        const raw = await fetchUserReminders(u.id);
-        setReminders(raw.map(mapReminderFromApi));
       }
+      const raw = await fetchReminders();
+      setReminders(raw.map(mapReminderFromApi));
     } catch {
-      setReminders([]);
+      /* ignore background poll errors */
     } finally {
-      setRemindersLoading(false);
+      if (!silent) setRemindersLoading(false);
     }
   }, []);
 
@@ -230,9 +233,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (user && screen === "dashboard") {
-      loadLinksAndReminders(user);
-    }
+    if (!user || screen !== "dashboard") return;
+    loadLinksAndReminders(user);
+    const id = setInterval(() => loadLinksAndReminders(user, { silent: true }), 5000);
+    return () => clearInterval(id);
   }, [user, screen, loadLinksAndReminders]);
 
   const handleEmergencyVoice = useCallback(async (phrase) => {
@@ -270,15 +274,86 @@ export default function App() {
     }
   }, [user]);
 
+  const handleChat = useCallback(async (message) => {
+    if (!message.trim() || chatBusyRef.current) return;
+    const ownerUserId = user?.role === "elder" ? user.id : elders[0]?.id ?? user?.id;
+    setChatMessages((prev) => [...prev, { role: "user", text: message }]);
+    chatBusyRef.current = true;
+    setChatBusy(true);
+    try {
+      const { reply, intent } = await chatWithNora({ message, ownerUserId });
+      setChatMessages((prev) => [...prev, { role: "nora", text: reply, intent: intent ?? null }]);
+    } catch {
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "nora", text: "Sorry, I couldn't reach the server. Please try again.", intent: null },
+      ]);
+    } finally {
+      chatBusyRef.current = false;
+      setChatBusy(false);
+    }
+  }, [user, elders]);
+
+  const handleCreateFromIntent = useCallback(async (intent) => {
+    let dueLocal = defaultDueDatetimeLocal();
+    if (intent.dueDateTime) {
+      const d = new Date(intent.dueDateTime);
+      if (!Number.isNaN(d.getTime()) && d > new Date()) {
+        const pad = (n) => String(n).padStart(2, "0");
+        dueLocal = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      }
+    }
+    setChatPrefill({
+      title: intent.title || "",
+      category: (intent.category || "personal").toLowerCase(),
+      description: "",
+      dueLocal,
+    });
+    setChatOpen(false);
+  }, []);
+
+  const noraChatDebounceRef = useRef(null);
+  const noraQuerySentRef = useRef("");
+
   useEffect(() => {
     onVoiceTranscriptRef.current = (transcript) => {
       if (user?.role !== "elder") return;
-      if (!transcriptLooksLikeEmergency(transcript)) return;
+
+      // "Hey Nora" wake word — route transcript to chat
+      const noraMatch = transcript.match(/\bhey[\s,]+nora[,\s]*(.*)/i);
+      if (noraMatch) {
+        const query = noraMatch[1].trim();
+        setChatOpen(true);
+        if (query.length > 4 && query !== noraQuerySentRef.current) {
+          clearTimeout(noraChatDebounceRef.current);
+          noraChatDebounceRef.current = setTimeout(() => {
+            noraQuerySentRef.current = query;
+            handleChat(query);
+          }, 1200);
+        }
+        return;
+      }
+
+      // Fast client-side emergency check
+      if (transcriptLooksLikeEmergency(transcript)) {
+        if (Date.now() < voiceCooldownUntilRef.current) return;
+        voiceCooldownUntilRef.current = Date.now() + 10000;
+        void handleEmergencyVoice(transcript);
+        return;
+      }
+
+      // Nova Micro fallback for complex distress phrases
       if (Date.now() < voiceCooldownUntilRef.current) return;
-      voiceCooldownUntilRef.current = Date.now() + 10000;
-      void handleEmergencyVoice(transcript);
+      detectEmergency(transcript)
+        .then(({ is_emergency, confidence }) => {
+          if (is_emergency && confidence >= 0.65) {
+            voiceCooldownUntilRef.current = Date.now() + 10000;
+            void handleEmergencyVoice(transcript);
+          }
+        })
+        .catch(() => { /* ignore */ });
     };
-  }, [user, handleEmergencyVoice]);
+  }, [user, handleEmergencyVoice, handleChat]);
 
   useEffect(() => {
     const active = user?.role === "elder" && screen === "dashboard";
@@ -432,13 +507,11 @@ export default function App() {
     }
   };
 
-  const handleCreateReminder = async ({ title, category, description, dueLocal }) => {
+  const handleCreateReminder = async ({ title, category, description, dueLocal, repeatType }) => {
     if (!user) return;
 
-    const ownerId = user.role === "elder" ? user.id : elders[0]?.id;
-    if (!ownerId) {
-      throw new Error("Link with an elder first so events can be saved for them.");
-    }
+    // Caregivers create events on behalf of their linked elder; elders own their own
+    const ownerId = user.role === "caregiver" ? (elders[0]?.id ?? user.id) : user.id;
 
     const due = new Date(dueLocal);
     if (Number.isNaN(due.getTime())) throw new Error("Invalid date or time.");
@@ -451,12 +524,13 @@ export default function App() {
       description: description?.trim() ? description.trim() : null,
       category,
       dueDateTime: due.toISOString(),
+      repeatType: repeatType ?? null,
     });
 
     await loadLinksAndReminders(user);
   };
 
-  const handleUpdateReminder = async (reminderId, { title, category, description, dueLocal }) => {
+  const handleUpdateReminder = async (reminderId, { title, category, description, dueLocal, repeatType }) => {
     const due = new Date(dueLocal);
     if (Number.isNaN(due.getTime())) throw new Error("Invalid date or time.");
     if (due <= new Date()) throw new Error("Pick a date and time in the future.");
@@ -466,6 +540,7 @@ export default function App() {
       description: description?.trim() ? description.trim() : null,
       category,
       dueDateTime: due.toISOString(),
+      repeatType: repeatType ?? null,
     });
 
     await loadLinksAndReminders(user);
@@ -536,6 +611,14 @@ export default function App() {
                 onCreateReminder={handleCreateReminder}
                 onUpdateReminder={handleUpdateReminder}
                 onDeleteReminder={handleDeleteReminder}
+                chatOpen={chatOpen}
+                setChatOpen={setChatOpen}
+                chatMessages={chatMessages}
+                chatBusy={chatBusy}
+                onChat={handleChat}
+                onCreateFromIntent={handleCreateFromIntent}
+                chatPrefill={chatPrefill}
+                setChatPrefill={setChatPrefill}
               />
             )}
           </div>
@@ -707,6 +790,14 @@ function DashboardScreen({
   onCreateReminder,
   onUpdateReminder,
   onDeleteReminder,
+  chatOpen,
+  setChatOpen,
+  chatMessages,
+  chatBusy,
+  onChat,
+  onCreateFromIntent,
+  chatPrefill,
+  setChatPrefill,
 }) {
   const isElder = user.role === "elder";
   const primaryElder = elders[0];
@@ -738,17 +829,46 @@ function DashboardScreen({
           <p className="mt-0.5 truncate text-[11px] text-neutral-400">{user.email}</p>
         </div>
 
-        <button
-          type="button"
-          onClick={onLogout}
-          className="rounded-2xl border border-neutral-300 bg-white px-3 py-2 text-right shadow-sm"
-        >
-          <div className="text-[11px] font-medium leading-tight text-violet-700">
-            {isElder ? "Elder User" : "Son / Daughter"}
-          </div>
-          <div className="text-xs text-neutral-500">Logout</div>
-        </button>
+        <div className="flex flex-col items-end gap-1.5">
+          <button
+            type="button"
+            onClick={onLogout}
+            className="rounded-2xl border border-neutral-300 bg-white px-3 py-2 text-right shadow-sm"
+          >
+            <div className="text-[11px] font-medium leading-tight text-violet-700">
+              {isElder ? "Elder User" : "Son / Daughter"}
+            </div>
+            <div className="text-xs text-neutral-500">Logout</div>
+          </button>
+          <button
+            type="button"
+            onClick={() => setChatOpen(true)}
+            className="flex items-center gap-1.5 rounded-2xl border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-medium text-violet-700 shadow-sm"
+          >
+            <span>💬</span> Ask Nora
+          </button>
+        </div>
       </div>
+
+      {chatOpen && (
+        <NoraChatModal
+          messages={chatMessages}
+          busy={chatBusy}
+          onSend={onChat}
+          onClose={() => { setChatOpen(false); }}
+          onCreateFromIntent={onCreateFromIntent}
+          onVoiceStart={() => {
+            listeningActiveRef.current = false;
+            try { recognitionRef.current?.stop(); } catch { /* noop */ }
+          }}
+          onVoiceEnd={() => {
+            if (user?.role === "elder") {
+              listeningActiveRef.current = true;
+              setTimeout(() => tryStartListeningRef.current(), 300);
+            }
+          }}
+        />
+      )}
 
       <main className="min-h-0 flex-1 overflow-y-auto px-5 pb-6 pt-3">
         {isElder && (
@@ -836,6 +956,8 @@ function DashboardScreen({
           onCreateReminder={onCreateReminder}
           onUpdateReminder={onUpdateReminder}
           onDeleteReminder={onDeleteReminder}
+          chatPrefill={chatPrefill}
+          onChatPrefillConsumed={() => setChatPrefill(null)}
         />
 
         {isElder && (
@@ -887,10 +1009,20 @@ function ReminderSection({
   onCreateReminder,
   onUpdateReminder,
   onDeleteReminder,
+  chatPrefill,
+  onChatPrefillConsumed,
 }) {
   const [showMenu, setShowMenu] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
+  const [prepItem, setPrepItem] = useState(null);
+
+  useEffect(() => {
+    if (chatPrefill) {
+      setShowCreateModal(true);
+      onChatPrefillConsumed();
+    }
+  }, [chatPrefill, onChatPrefillConsumed]);
 
   return (
     <section className="relative mb-3 rounded-[1.7rem] border border-neutral-200 bg-white p-3 shadow-sm">
@@ -949,6 +1081,7 @@ function ReminderSection({
             item={item}
             onEdit={() => setEditingItem(item)}
             onDelete={() => onDeleteReminder(item.id)}
+            onPrepare={() => setPrepItem(item)}
           />
         ))}
       </div>
@@ -957,7 +1090,7 @@ function ReminderSection({
         <ReminderModal
           title="Create event"
           submitLabel="Save event"
-          initialValues={{
+          initialValues={chatPrefill ?? {
             title: "",
             category: "personal",
             description: "",
@@ -971,6 +1104,13 @@ function ReminderSection({
         />
       )}
 
+      {prepItem && (
+        <TaskPrepModal
+          item={prepItem}
+          onClose={() => setPrepItem(null)}
+        />
+      )}
+
       {editingItem && (
         <ReminderModal
           title="Update event"
@@ -980,6 +1120,7 @@ function ReminderSection({
             category: editingItem.type || "personal",
             description: editingItem.description || "",
             dueLocal: editingItem.dueLocal || defaultDueDatetimeLocal(),
+            repeatType: editingItem.repeatType ?? null,
           }}
           onClose={() => setEditingItem(null)}
           onSubmit={async (values) => {
@@ -992,7 +1133,7 @@ function ReminderSection({
   );
 }
 
-function ReminderCard({ item, onEdit, onDelete }) {
+function ReminderCard({ item, onEdit, onDelete, onPrepare }) {
   const [revealed, setRevealed] = useState(false);
   const startXRef = useRef(null);
   const movedRef = useRef(false);
@@ -1049,23 +1190,30 @@ function ReminderCard({ item, onEdit, onDelete }) {
     <div className="overflow-hidden rounded-2xl">
       <div className="relative">
         <div
-          className={`absolute inset-y-0 right-0 z-10 flex items-center gap-2 pr-3 transition-all ${
+          className={`absolute inset-y-0 right-0 z-10 flex items-center gap-1.5 pr-2 transition-all ${
             revealed ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >
           <button
             type="button"
+            onClick={(e) => { e.stopPropagation(); onPrepare(); }}
+            className="rounded-xl bg-violet-500 px-2.5 py-2 text-xs font-semibold text-white"
+          >
+            Prep
+          </button>
+          <button
+            type="button"
             onClick={handleEdit}
-            className="rounded-xl bg-sky-600 px-3 py-2 text-xs font-semibold text-white"
+            className="rounded-xl bg-sky-600 px-2.5 py-2 text-xs font-semibold text-white"
           >
             Edit
           </button>
           <button
             type="button"
             onClick={handleDelete}
-            className="rounded-xl bg-red-500 px-3 py-2 text-xs font-semibold text-white"
+            className="rounded-xl bg-red-500 px-2.5 py-2 text-xs font-semibold text-white"
           >
-            Delete
+            Del
           </button>
         </div>
 
@@ -1076,7 +1224,7 @@ function ReminderCard({ item, onEdit, onDelete }) {
           onTouchMove={handleTouchMove}
           onTouchEnd={handleTouchEnd}
           className={`flex w-full cursor-pointer items-center justify-between rounded-2xl bg-neutral-50 px-3 py-2 text-left shadow-sm transition-transform duration-200 ${
-            revealed ? "-translate-x-[120px]" : "translate-x-0"
+            revealed ? "-translate-x-[152px]" : "translate-x-0"
           }`}
         >
           <div className="min-w-0">
@@ -1086,7 +1234,12 @@ function ReminderCard({ item, onEdit, onDelete }) {
             </div>
           </div>
 
-          <div className="ml-3 flex items-center gap-2">
+          <div className="ml-3 flex items-center gap-1.5 shrink-0">
+            {item.repeatType && (
+              <span className="whitespace-nowrap rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                ↻ {item.repeatType}
+              </span>
+            )}
             <span className="whitespace-nowrap rounded-full bg-violet-100 px-2.5 py-1 text-[11px] font-medium capitalize text-violet-700">
               {item.type}
             </span>
@@ -1103,6 +1256,7 @@ function ReminderModal({ title, submitLabel, initialValues, onClose, onSubmit })
     category: initialValues.category ?? "personal",
     description: initialValues.description ?? "",
     dueLocal: initialValues.dueLocal ?? defaultDueDatetimeLocal(),
+    repeatType: initialValues.repeatType ?? null,
   }));
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1173,6 +1327,17 @@ function ReminderModal({ title, submitLabel, initialValues, onClose, onSubmit })
             />
           </div>
 
+          <select
+            value={form.repeatType ?? ""}
+            onChange={(e) => updateField("repeatType", e.target.value || null)}
+            className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-3 py-2.5 text-sm outline-none"
+          >
+            <option value="">Does not repeat</option>
+            <option value="daily">Repeats daily</option>
+            <option value="weekly">Repeats weekly</option>
+            <option value="monthly">Repeats monthly</option>
+          </select>
+
           <input
             type="text"
             value={form.description}
@@ -1240,6 +1405,247 @@ function EmergencyCaregiverBanner({ alerts, onAcknowledge, busyId }) {
         </div>
       ))}
     </section>
+  );
+}
+
+function NoraChatModal({ messages, busy, onSend, onClose, onCreateFromIntent, onVoiceStart, onVoiceEnd }) {
+  const [input, setInput] = useState("");
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [voiceInterim, setVoiceInterim] = useState("");
+  const bottomRef = useRef(null);
+  const chatRecogRef = useRef(null);
+  const onSendRef = useRef(onSend);
+  const onVoiceEndRef = useRef(onVoiceEnd);
+  const finalRef = useRef("");
+
+  useEffect(() => { onSendRef.current = onSend; }, [onSend]);
+  useEffect(() => { onVoiceEndRef.current = onVoiceEnd; }, [onVoiceEnd]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, busy, voiceInterim]);
+
+  // Create the recognizer once on mount only
+  useEffect(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return;
+    const r = new SR();
+    r.continuous = false;
+    r.interimResults = true;
+    r.lang = "en-US";
+
+    r.onresult = (e) => {
+      let interim = "";
+      let final = "";
+      for (let i = 0; i < e.results.length; i++) {
+        if (e.results[i].isFinal) final += e.results[i][0].transcript;
+        else interim += e.results[i][0].transcript;
+      }
+      finalRef.current = final || interim;
+      setVoiceInterim(final || interim);
+    };
+
+    r.onend = () => {
+      setVoiceListening(false);
+      onVoiceEndRef.current?.();
+      const text = finalRef.current.trim();
+      finalRef.current = "";
+      setVoiceInterim("");
+      if (text) onSendRef.current(text);
+    };
+
+    r.onerror = () => {
+      setVoiceListening(false);
+      onVoiceEndRef.current?.();
+      finalRef.current = "";
+      setVoiceInterim("");
+    };
+
+    chatRecogRef.current = r;
+    return () => { try { r.abort(); } catch { /* noop */ } };
+  }, []); // empty deps — create once
+
+  const toggleVoice = () => {
+    const r = chatRecogRef.current;
+    if (!r) return;
+    if (voiceListening) {
+      r.stop();
+    } else {
+      onVoiceStart?.();
+      finalRef.current = "";
+      setVoiceInterim("");
+      setVoiceListening(true);
+      try {
+        r.start();
+      } catch {
+        setVoiceListening(false);
+        onVoiceEnd?.();
+      }
+    }
+  };
+
+  const submit = () => {
+    const msg = input.trim();
+    if (!msg || busy) return;
+    setInput("");
+    onSend(msg);
+  };
+
+  const speechAvailable = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+
+  return (
+    <div className="absolute inset-0 z-40 flex flex-col rounded-[2.6rem] bg-[#f7f5f1]">
+      <div className="flex items-center justify-between px-5 pt-5 pb-3 border-b border-neutral-200">
+        <div>
+          <div className="text-xs uppercase tracking-[0.3em] text-neutral-400">Nova AI</div>
+          <div className="text-base font-semibold text-neutral-900">Ask Nora</div>
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded-full border border-neutral-200 bg-white px-3 py-1.5 text-sm text-neutral-500"
+        >
+          ✕
+        </button>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 space-y-2">
+        {messages.length === 0 && !voiceListening && (
+          <div className="mt-6 text-center text-sm text-neutral-400">
+            {speechAvailable
+              ? <>Tap the mic and speak, or type below.<br /><span className="font-medium text-neutral-600">"Remind me Tuesday I have a doctor appointment"</span></>
+              : <>Type your message below.<br /><span className="font-medium text-neutral-600">"Remind me Tuesday I have a doctor appointment"</span></>}
+          </div>
+        )}
+
+        {messages.map((m, i) => (
+          <div key={i} className={`flex flex-col gap-1 ${m.role === "user" ? "items-end" : "items-start"}`}>
+            <div
+              className={`max-w-[85%] rounded-2xl px-3 py-2 text-sm leading-snug ${
+                m.role === "user"
+                  ? "bg-violet-600 text-white"
+                  : "bg-white border border-neutral-200 text-neutral-900 shadow-sm"
+              }`}
+            >
+              {m.text}
+            </div>
+            {m.intent?.type === "create_reminder" && (
+              <button
+                type="button"
+                onClick={() => onCreateFromIntent(m.intent)}
+                className="flex items-center gap-1.5 rounded-2xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-800 shadow-sm"
+              >
+                ＋ Add "{m.intent.title}" as reminder
+              </button>
+            )}
+          </div>
+        ))}
+
+        {voiceListening && (
+          <div className="flex flex-col items-center gap-2 py-4">
+            <div className="flex items-center gap-2">
+              <span className="h-3 w-3 animate-pulse rounded-full bg-violet-500" />
+              <span className="text-sm font-medium text-violet-700">Listening…</span>
+            </div>
+            {voiceInterim && (
+              <div className="max-w-[85%] rounded-2xl border border-violet-100 bg-violet-50 px-3 py-2 text-sm italic text-violet-700">
+                {voiceInterim}
+              </div>
+            )}
+          </div>
+        )}
+
+        {busy && (
+          <div className="flex items-start">
+            <div className="rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-400 shadow-sm">
+              Nora is thinking…
+            </div>
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      <div className="flex gap-2 border-t border-neutral-200 bg-white px-4 py-3">
+        {speechAvailable && (
+          <button
+            type="button"
+            onClick={toggleVoice}
+            disabled={busy}
+            className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-lg shadow-sm transition-colors ${
+              voiceListening
+                ? "animate-pulse bg-violet-600 text-white"
+                : "border border-neutral-200 bg-neutral-50 text-neutral-600"
+            }`}
+          >
+            🎤
+          </button>
+        )}
+        <input
+          type="text"
+          value={voiceListening ? voiceInterim : input}
+          onChange={(e) => !voiceListening && setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder={voiceListening ? "Listening…" : "Ask Nora anything…"}
+          readOnly={voiceListening}
+          className="min-w-0 flex-1 rounded-2xl border border-neutral-200 bg-neutral-50 px-3 py-2.5 text-sm outline-none"
+        />
+        <button
+          type="button"
+          onClick={submit}
+          disabled={busy || voiceListening || !input.trim()}
+          className="rounded-2xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm disabled:opacity-50"
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TaskPrepModal({ item, onClose }) {
+  const [content, setContent] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setLoading(true);
+    setError("");
+    prepareTask(item.id)
+      .then(({ content: c }) => setContent(c))
+      .catch((e) => setError(e.message ?? "Could not load preparation guide."))
+      .finally(() => setLoading(false));
+  }, [item.id]);
+
+  return (
+    <div className="absolute inset-0 z-30 flex items-center justify-center rounded-[1.7rem] bg-black/30 p-3">
+      <div className="w-full rounded-[1.5rem] border border-neutral-200 bg-white p-4 shadow-xl max-h-[90%] flex flex-col">
+        <div className="mb-3 flex items-start justify-between gap-2">
+          <div>
+            <div className="text-[11px] uppercase tracking-widest text-violet-500">Preparation Guide</div>
+            <div className="text-sm font-semibold text-neutral-900 mt-0.5">{item.title}</div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-full px-2 py-1 text-sm text-neutral-500 shrink-0"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {loading && (
+            <div className="py-6 text-center text-sm text-neutral-400">Nova is preparing your guide…</div>
+          )}
+          {error && (
+            <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">{error}</div>
+          )}
+          {!loading && !error && (
+            <div className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-700">{content}</div>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
